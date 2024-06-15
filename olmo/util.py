@@ -335,7 +335,7 @@ def file_size(path: PathOrStr) -> int:
         else:
             raise NotImplementedError(f"file size not implemented for '{parsed.scheme}' files")
     else:
-        return os.stat(path).st_size
+        return os.stat(path).st_size  # https://docs.python.org/3/library/stat.html#stat.ST_SIZE
 
 
 def upload(source: PathOrStr, target: str, save_overwrite: bool = False):

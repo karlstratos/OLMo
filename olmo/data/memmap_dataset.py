@@ -43,7 +43,7 @@ class MemMapDataset(Dataset[Dict[str, Any]]):
 
     def __init__(
         self,
-        *paths: PathOrStr,
+        *paths: PathOrStr,  # I guess they did this to pass multiple paths. But as a result, need * on list.
         chunk_size: int = 1024,
         memmap_dtype=np.uint16,
         metadata: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None,
@@ -87,6 +87,9 @@ class MemMapDataset(Dataset[Dict[str, Any]]):
         # For compatibility with composer's SpeedMonitor callback.
         return self.chunk_size
 
+    # Point of property, even with only using the getter:
+    # (1) Laziness: if offsets is never accessed, this expensive call is never made
+    # (2) Caching: no recomputation
     @property
     def offsets(self) -> List[Tuple[int, int]]:
         # Create the global S3 client up front to work around a threading issue in boto.
@@ -107,6 +110,7 @@ class MemMapDataset(Dataset[Dict[str, Any]]):
             path_to_mask_path: Dict[PathOrStr, PathOrStr] = {}
             mask_path_to_length: Dict[PathOrStr, int] = {}
 
+            # Multi-thread over data files, compute how many sequences/chunks can be extracted from each
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 path_futures = []
                 mask_path_futures = []
@@ -135,42 +139,46 @@ class MemMapDataset(Dataset[Dict[str, Any]]):
                 end_offset = start_offset + length
                 self._mmap_offsets.append((start_offset, end_offset))
                 start_offset += length
-        return self._mmap_offsets
 
+        return self._mmap_offsets  # (file1_seq_start, file1_seq_end), (file2_seq_start, file2_seq_end), ...
+    # So offsets[-1][1] = last_file_seq_end = number of sequences
+
+    #                                        (seq index *within* the file)
+    #                                                     v
     def _read_chunk_from_memmap(self, path: PathOrStr, index: int, dtype=None) -> torch.Tensor:
         dtype = dtype or self.dtype
         item_size = dtype(0).itemsize
         bytes_start = index * item_size * self._chunk_size
         num_bytes = item_size * self._chunk_size
-        buffer = get_bytes_range(path, bytes_start, num_bytes)
-        array = np.frombuffer(buffer, dtype=dtype)
+        buffer = get_bytes_range(path, bytes_start, num_bytes)  # Loading bytes for the seq in this file
+        array = np.frombuffer(buffer, dtype=dtype)  # Converting them to uint16 numbers
         if dtype == np.bool_:
             return torch.tensor(array)
         else:
             return torch.tensor(array.astype(np.int_), dtype=torch.long)
 
     def _get_file_length(self, path, dtype=None) -> Tuple[PathOrStr, int]:
-        dtype = dtype or self.dtype
-        item_size = dtype(0).itemsize
-        return path, file_size(path) // (item_size * self._chunk_size)
+        dtype = dtype or self.dtype  # numpy.uint16
+        item_size = dtype(0).itemsize  # 2
+        return path, file_size(path) // (item_size * self._chunk_size)  # num seqs
 
     def __len__(self) -> int:
         if self._num_instances is None:
-            self._num_instances = self.offsets[-1][1]
+            self._num_instances = self.offsets[-1][1]  # number of sequences in all the files
         return self._num_instances
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         index = int(index)  # in case this is a numpy int type.
-        pos_index = index if index >= 0 else len(self) + index
+        pos_index = index if index >= 0 else len(self) + index  # Allow negative indexing (-1: last seq)
 
-        # The index of the memmap array within 'self.memmaps'
+
+        # Point: (1) find which file (memmap_index), (2) boundary check for negative pos_index (index<-len(self))
         memmap_index: Optional[int] = None
-        # The 'index' relative to the corresponding memmap array.
         memmap_local_index: Optional[int] = None
         for i, (offset_start, offset_end) in enumerate(self.offsets):
             if offset_start <= pos_index < offset_end:
                 memmap_index = i
-                memmap_local_index = pos_index - offset_start
+                memmap_local_index = pos_index - offset_start  # Index within that file
 
         if memmap_index is None or memmap_local_index is None:
             raise IndexError(f"{index} is out of bounds for dataset of size {len(self)}")
